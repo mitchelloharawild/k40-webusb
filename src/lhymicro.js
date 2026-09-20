@@ -540,7 +540,6 @@ export function buildRasterJob({ rows, rowStepMils, feedMmPerSec, board = 'M2' }
   const cutEnc = new LhymicroEncoder();
   const pad = 2;
   let sign = -1;
-  let trackedY = 0;
 
   for (let i = 0; i < rowPoints.length; i++) {
     sign = -sign;
@@ -577,13 +576,18 @@ export function buildRasterJob({ rows, rowStepMils, feedMmPerSec, board = 'M2' }
   // stepped Y once more on this reversal.
   cutEnc.makeDirDist(pad, 0, false);
   lastX += pad;
-  if (sign < 0) trackedY += rowStepMils;
+  // Y position after processing every row, tracked the same way egv.py's
+  // `lasty` is: each row steps the controller by `rowStepMils` from the
+  // last, and a final right-to-left row (sign < 0) steps it once more on
+  // its closing reversal.
+  let lastY = (rowPoints.length - 1) * rowStepMils;
+  if (sign < 0) lastY += rowStepMils;
   cutEnc.flush(false);
   push(cutEnc.toBytes());
 
   // Plain (non-optimized) travel move back to the job's starting position.
   const dxFinal = -lastX;
-  const dyFinal = rowStepMils < 0 ? -trackedY + rowStepMils : -trackedY - rowStepMils;
+  const dyFinal = rowStepMils < 0 ? -lastY + rowStepMils : -lastY - rowStepMils;
   const returnEnc = new LhymicroEncoder();
   returnEnc.makeDirDist(dxFinal, dyFinal, false);
   returnEnc.flush(false);
