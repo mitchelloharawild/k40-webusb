@@ -2,14 +2,15 @@
  * LHYMICRO-GL: the byte-opcode job language the M2-Nano executes.
  *
  * Ported from egv.py's `egv` class (move/flush/make_distance/make_dir_dist/
- * make_cut_line/make_egv_data/rapid_move_fast). This covers straight-line
- * vector cutting (including multi-path jobs with dogleg-optimized travel
- * between paths) and raster (image engraving) jobs; it does NOT yet port
- * mid-job speed changes (change_speed), the temporary-rapid-feed travel
- * mode (rapid_move_slow/raster_rapid_move_slow — both depend on
- * change_speed), or the raster path's blank-row jump-ahead optimization
- * (multiple blank rows collapsed into one Y move) — see _dev/webapp.md §6
- * in k40-control for what those do in the original.
+ * make_cut_line/make_egv_data/rapid_move_fast/change_speed). This covers
+ * straight-line vector cutting (including multi-path jobs with
+ * dogleg-optimized travel and mid-job speed changes between paths) and
+ * raster (image engraving) jobs; it does NOT yet port raster mid-job speed
+ * changes, the temporary-rapid-feed travel mode (rapid_move_slow/
+ * raster_rapid_move_slow — both depend on change_speed), or the raster
+ * path's blank-row jump-ahead optimization (multiple blank rows collapsed
+ * into one Y move) — see _dev/webapp.md §6 in k40-control for what those do
+ * in the original.
  */
 import { LaserSpeed } from './laser-speed.js';
 
@@ -237,6 +238,55 @@ export class LhymicroEncoder {
     this.#codes = [];
     return codes;
   }
+
+  /**
+   * Append raw byte(s) straight to the output, bypassing modal tracking
+   * entirely — matching egv.py's `self.write()`, which is used both for
+   * tracked codes (from `move()`/`flush()`) and untracked framing bytes.
+   * Used by `changeSpeed()` for framing that must land in the byte stream
+   * without affecting `move()`'s modal direction/laser bookkeeping.
+   * @param {number|number[]} bytes
+   */
+  writeRaw(bytes) {
+    if (Array.isArray(bytes)) {
+      this.#codes.push(...bytes);
+    } else {
+      this.#codes.push(bytes);
+    }
+  }
+
+  /**
+   * Emit a mid-job speed change: a small pad move bracketing a "@NSE"
+   * motion-state reset, a new speed code, and a re-primed "NRB S1E" start
+   * marker — ported from `change_speed()` in egv.py.
+   *
+   * If `laserOn` is true (changing speed mid-cut), the laser is forced off
+   * for the reset via a raw, untracked byte — matching egv.py, this
+   * leaves modal laser-state tracking momentarily stale, so the next
+   * tracked move that turns the laser back on emits its own redundant
+   * on/off byte; harmless on the wire, but not worth "fixing" out of a
+   * faithful port. Calling this between paths, with the laser already off
+   * (`laserOn=false`), avoids that redundancy entirely.
+   *
+   * @param {number} feedMmPerSec
+   * @param {string} board
+   * @param {boolean} [laserOn=false] whether the laser is on going into
+   *   (and should resume after) this call
+   * @param {number} [rasterStep=0]
+   * @param {boolean} [pad=true]
+   */
+  changeSpeed(feedMmPerSec, board, laserOn = false, rasterStep = 0, pad = true) {
+    const cspad = 5;
+    if (laserOn) this.writeRaw(Opcode.LASER_OFF);
+    if (pad) this.makeDirDist(-cspad, -cspad, false);
+    this.flush(false);
+    this.writeRaw(ascii('@NSE'));
+    this.writeRaw(makeSpeed(feedMmPerSec, board, rasterStep));
+    this.writeRaw(ascii('NRBS1EU'));
+    if (pad) this.makeDirDist(cspad, cspad, false);
+    this.flush(false);
+    if (laserOn) this.writeRaw(Opcode.LASER_ON);
+  }
 }
 
 /**
@@ -303,20 +353,29 @@ function rapidMoveFast(dxMils, dyMils) {
  * Build a complete vector-cut job: speed code, header, one or more cut
  * paths (straight/diagonal segments through each path's points in order),
  * and a return move + footer — the `Raster_step == 0` branch of
- * `make_egv_data()` in egv.py, minus mid-job speed changes.
+ * `make_egv_data()` in egv.py.
  *
  * Laser-off travel — between paths, and the final move back to the job's
  * starting position — uses a plain move when short, or a dogleg-optimized
  * rapid move (`rapid_move_fast`) when long enough that dragging the head
  * straight through material in its path would matter.
  *
+ * A path may override the job's feed rate; when a path's effective feed
+ * differs from the previous one, a mid-job speed change (`change_speed()`
+ * in egv.py) is emitted between the travel move to that path and its first
+ * cut, so each path is cut at its own speed.
+ *
  * @param {object} opts
- * @param {[number, number][][]} opts.paths one array per cut path, each an
- *   array of vertices in mils, relative to the machine's current position
- *   (paths[0][0]) or the previous path's last point (paths[n>0][0]); each
- *   path's first point is a laser-off travel move, the rest are cut with
- *   the laser on. Every path needs at least 2 points.
- * @param {number} opts.feedMmPerSec
+ * @param {(([number, number][])|{points: [number, number][], feedMmPerSec: number})[]} opts.paths
+ *   one entry per cut path: either a plain array of vertices (cut at the
+ *   job's `feedMmPerSec`), or `{ points, feedMmPerSec }` to cut that path at
+ *   a different feed rate. Vertices are mils, relative to the machine's
+ *   current position (paths[0].points[0]) or the previous path's last point
+ *   (paths[n>0].points[0]); each path's first point is a laser-off travel
+ *   move, the rest are cut with the laser on. Every path needs at least 2
+ *   points.
+ * @param {number} opts.feedMmPerSec default feed rate for paths that don't
+ *   specify their own
  * @param {string} [opts.board='M2']
  * @returns {Uint8Array} bytes ready for `K40Transport#sendJob()`
  */
@@ -324,8 +383,11 @@ export function buildVectorJob({ paths, feedMmPerSec, board = 'M2' }) {
   if (!paths || paths.length === 0) {
     throw new Error('buildVectorJob: need at least one path');
   }
-  paths.forEach((path, i) => {
-    if (path.length < 2) {
+  const normalizedPaths = paths.map((entry) =>
+    Array.isArray(entry) ? { points: entry, feedMmPerSec } : { feedMmPerSec, ...entry },
+  );
+  normalizedPaths.forEach(({ points }, i) => {
+    if (!points || points.length < 2) {
       throw new Error(`buildVectorJob: path ${i} needs a start point and at least one cut point`);
     }
   });
@@ -333,13 +395,14 @@ export function buildVectorJob({ paths, feedMmPerSec, board = 'M2' }) {
   const bytes = [];
   const push = (arr) => bytes.push(...arr);
 
-  push(makeSpeed(feedMmPerSec, board, 0));
+  let currentFeed = normalizedPaths[0].feedMmPerSec;
+  push(makeSpeed(currentFeed, board, 0));
 
   // Initial travel move (laser off) from the current head position to the
   // first path's first vertex. Points are mils, relative to that starting
   // position. This header move is always plain, even for a long distance —
   // egv.py only dogleg-optimizes travel that happens mid-job.
-  const [startX, startY] = paths[0][0];
+  const [startX, startY] = normalizedPaths[0].points[0];
   const headerEnc = new LhymicroEncoder();
   headerEnc.makeDirDist(startX, startY, false);
   headerEnc.flush(false);
@@ -372,14 +435,21 @@ export function buildVectorJob({ paths, feedMmPerSec, board = 'M2' }) {
     }
   };
 
-  for (let p = 0; p < paths.length; p++) {
-    const path = paths[p];
+  for (let p = 0; p < normalizedPaths.length; p++) {
+    const { points, feedMmPerSec: pathFeed } = normalizedPaths[p];
     if (p > 0) {
-      const [x, y] = path[0];
+      const [x, y] = points[0];
       travelTo(x, y);
+      if (pathFeed !== currentFeed) {
+        // Laser is off here (we just finished travelling to this path's
+        // start), so this never hits the mid-cut redundant on/off bytes —
+        // see LhymicroEncoder#changeSpeed.
+        enc.changeSpeed(pathFeed, board, false);
+        currentFeed = pathFeed;
+      }
     }
-    for (let i = 1; i < path.length; i++) {
-      const [x, y] = path[i];
+    for (let i = 1; i < points.length; i++) {
+      const [x, y] = points[i];
       enc.makeCutLine(x - lastX, y - lastY, true);
       lastX = x;
       lastY = y;

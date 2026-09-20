@@ -7,9 +7,10 @@ protocol reverse-engineered by [K40 Whisperer](https://www.scorchworks.com/K40wh
 (see `NOTICE.md` for provenance).
 
 This is an early scaffold: the low-level transport and the straight/diagonal
-vector-cutting and raster (image engraving) paths are implemented,
-including dogleg-optimized rapid travel between vector cut paths; mid-job
-speed changes and the raster path's rapid-travel mode are not yet ported.
+vector-cutting and raster (image engraving) paths are implemented, including
+dogleg-optimized rapid travel and mid-job speed changes between vector cut
+paths; raster mid-job speed changes and the raster path's rapid-travel mode
+are not yet ported.
 
 ## Why WebUSB, not Web Serial
 
@@ -46,6 +47,10 @@ await laser.unlock();
 // travel move. Travel between paths (and back to the start at the end) is
 // a plain move when short, or a dogleg-shaped "rapid" move when long enough
 // that dragging the head straight through material would matter.
+//
+// A path can override the job's feed rate with { points, feedMmPerSec }
+// instead of a plain point array; when it differs from the previous path's
+// feed, a mid-job speed change is inserted before that path is cut.
 const job = buildVectorJob({
   paths: [
     [
@@ -104,7 +109,7 @@ await laser.disconnect();
 - Raster jobs require every row to have at least one burn interval — the
   original's blank-row jump-ahead optimization (collapsing several blank
   rows into one larger Y move) isn't ported.
-- No mid-job speed changes — every path in a vector job, and the whole
-  raster job, is cut at a single feed rate.
+- No mid-job speed changes in raster jobs — the whole job is cut at a
+  single feed rate (vector jobs can vary feed rate per path).
 - Raster jobs don't yet get the dogleg/rapid-feed travel optimizations that
   vector jobs' between-path travel has.
