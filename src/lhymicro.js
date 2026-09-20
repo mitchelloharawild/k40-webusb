@@ -5,12 +5,12 @@
  * make_cut_line/make_egv_data/rapid_move_fast/change_speed). This covers
  * straight-line vector cutting (including multi-path jobs with
  * dogleg-optimized travel and mid-job speed changes between paths) and
- * raster (image engraving) jobs; it does NOT yet port raster mid-job speed
- * changes, the temporary-rapid-feed travel mode (rapid_move_slow/
- * raster_rapid_move_slow — both depend on change_speed), or the raster
- * path's blank-row jump-ahead optimization (multiple blank rows collapsed
- * into one Y move) — see _dev/webapp.md §6 in k40-control for what those do
- * in the original.
+ * raster (image engraving) jobs, including its blank-row jump-ahead
+ * optimization; it does NOT yet port raster mid-job speed changes, the
+ * temporary-rapid-feed travel mode (rapid_move_slow/raster_rapid_move_slow
+ * — both depend on change_speed), or the reduced-speed final return move
+ * (`max_return_feed`) — see _dev/webapp.md §6 in k40-control for what those
+ * do in the original.
  */
 import { LaserSpeed } from './laser-speed.js';
 
@@ -472,22 +472,29 @@ export function buildVectorJob({ paths, feedMmPerSec, board = 'M2' }) {
  * Build a complete raster (image engraving) job: a speed code with an
  * embedded raster step, a "swing"-mode header, boustrophedon (alternating
  * left/right) scanning of each row with the small backlash-compensation
- * "pad" move at each direction reversal, and a return move + footer — the
- * `Raster_step != 0` branch of `make_egv_data()` in egv.py, minus its
- * blank-row jump optimization (`adj_steps`), `Rapid_Feed_Rate` travel mode,
- * and `FlipXoffset` mirroring.
+ * "pad" move at each direction reversal, a blank-row jump-ahead optimization,
+ * and a return move + footer — the `Raster_step != 0` branch of
+ * `make_egv_data()` in egv.py, minus its `Rapid_Feed_Rate` travel mode and
+ * `FlipXoffset` mirroring.
  *
  * The controller itself steps the Y axis by exactly `rowStepMils` (per the
  * `G<step>` suffix in the raster speed code) each time the horizontal scan
- * direction reverses, so this function never emits an explicit Y move
- * within a row — only once, in the final return-to-start move.
+ * direction reverses, so a row immediately following the previous one needs
+ * no explicit Y move. A run of blank rows breaks that assumption — stepping
+ * through each one via a reversal would work, but wastes a full scan-line
+ * pass per blank row, so this instead either walks the gap with small
+ * non-cutting pad moves (`adj_steps` in egv.py) when it's short, or emits a
+ * single direct Y move to jump straight to the next burned row when it's
+ * long enough to be worth stopping the scan entirely — ported from the
+ * `abs(dy-Raster_step) != 0` branch of `make_egv_data()`'s raster loop.
  *
  * @param {object} opts
  * @param {[number, number][][]} opts.rows one entry per scan line, top to
  *   bottom; each entry is an ascending, non-overlapping array of
  *   `[xStartMils, xEndMils]` laser-on intervals for that row, relative to a
- *   shared X origin. Every row must have at least one interval — this does
- *   not port egv.py's handling of blank rows.
+ *   shared X origin. A row with no intervals (empty array) is a blank row —
+ *   skipped via the jump-ahead optimization above. At least one row overall
+ *   must have an interval.
  * @param {number} opts.rowStepMils distance between rows, mils; sign
  *   selects the controller's raster scan orientation ("L" if >= 0, "R" if
  *   < 0), matching `Raster_step`'s sign in egv.py.
@@ -503,32 +510,40 @@ export function buildRasterJob({ rows, rowStepMils, feedMmPerSec, board = 'M2' }
     throw new Error('buildRasterJob: rowStepMils must be non-zero');
   }
 
-  // Flatten each row's [start, end] intervals into an ascending list of
-  // (x, loop) points, where two consecutive points sharing a loop id are a
-  // laser-on cut (the interval itself) and points from different loop ids
-  // are a laser-off positioning move — ported from the `scanline`/`loop`
-  // bookkeeping in make_egv_data()'s raster branch.
-  const rowPoints = rows.map((intervals, row) => {
+  // Flatten each non-blank row's [start, end] intervals into an ascending
+  // list of (x, loop) points, where two consecutive points sharing a loop id
+  // are a laser-on cut (the interval itself) and points from different loop
+  // ids are a laser-off positioning move — ported from the `scanline`/`loop`
+  // bookkeeping in make_egv_data()'s raster branch. Blank rows (no
+  // intervals) are dropped here; `y` (that row's position, had every row
+  // from 0 been stepped through) is kept so the gap between two active rows
+  // can still be measured in the main loop below.
+  const activeRows = [];
+  rows.forEach((intervals, row) => {
+    if (!intervals || intervals.length === 0) return;
     const points = intervals.flatMap((iv, idx) => [
       { x: iv[0], loop: idx },
       { x: iv[1], loop: idx },
     ]);
-    if (points.length === 0) {
-      throw new Error(`buildRasterJob: row ${row} has no burn intervals`);
-    }
-    return points;
+    activeRows.push({ points, y: row * rowStepMils });
   });
+  if (activeRows.length === 0) {
+    throw new Error('buildRasterJob: need at least one row with a burn interval');
+  }
 
   const bytes = [];
   const push = (arr) => bytes.push(...arr);
 
   push(makeSpeed(feedMmPerSec, board, rowStepMils));
 
-  // Initial travel move (laser off) to the first row's entry point (its
-  // leftmost point, since the first row always scans left-to-right).
-  let lastX = rowPoints[0][0].x;
+  // Initial travel move (laser off) to the first active row's entry point
+  // (its leftmost point, since the first row always scans left-to-right).
+  // Both axes are needed, not just X — leading blank rows put that row's Y
+  // away from the job's origin.
+  let lastX = activeRows[0].points[0].x;
+  let lastY = activeRows[0].y;
   const headerEnc = new LhymicroEncoder();
-  headerEnc.makeDirDist(lastX, 0, false);
+  headerEnc.makeDirDist(lastX, lastY, false);
   headerEnc.flush(false);
   push(headerEnc.toBytes());
 
@@ -537,27 +552,84 @@ export function buildRasterJob({ rows, rowStepMils, feedMmPerSec, board = 'M2' }
   push(ascii('B'));
   push(ascii('S1E'));
 
+  // A single continuous modal encoder for the whole scan body — cuts,
+  // backlash pad moves, blank-row walking pad moves, and the Y move inside
+  // a jump-ahead — matching egv.py's single `self` instance across the loop
+  // (in particular, routing the jump-ahead's Y move through this same
+  // encoder, rather than a throwaway one, is what keeps its modal direction
+  // tracking correct for the move that follows).
   const cutEnc = new LhymicroEncoder();
   const pad = 2;
   let sign = -1;
+  // Mirrors egv.py's `Rapid_flag`: true for the very first row (nothing to
+  // preload backlash against yet) and immediately after a jump-ahead (which
+  // already brought the head to a full stop, so there's nothing to
+  // preload). Governs whether the row-end pad move below gets the full
+  // backlash-compensation dance or just a plain move.
+  let rapidFlag = true;
 
-  for (let i = 0; i < rowPoints.length; i++) {
+  for (let i = 0; i < activeRows.length; i++) {
     sign = -sign;
-    const points = sign === 1 ? rowPoints[i] : rowPoints[i].slice().reverse();
+    const { points: rowPts, y } = activeRows[i];
+    const dy = y - lastY;
 
-    const xr = points[0].x;
-    const dxr = xr - lastX;
-    if (i > 0 && dxr * sign <= 0) {
-      // Backlash-compensation dance: overshoot opposite the new scan
-      // direction, travel the full distance, then re-overshoot forward —
-      // nets out to `dxr` but preloads the stepper before the reversal.
-      // Ported from the `Rapid_flag == False` row-end padding branch.
-      cutEnc.makeDirDist(-sign * pad, 0, false);
-      cutEnc.makeDirDist(dxr, 0, false);
-      cutEnc.makeDirDist(sign * pad, 0, false);
-      lastX += dxr;
+    let xr = sign === 1 ? rowPts[0].x : rowPts[rowPts.length - 1].x;
+    let dxr = xr - lastX;
+
+    if (Math.abs(dy - rowStepMils) !== 0 && !rapidFlag) {
+      // One or more blank rows separate this row from the last one drawn.
+      const yoffset = dxr * sign < 0 ? -rowStepMils * 3 : -rowStepMils;
+      const yoffsetSign = Math.sign(yoffset);
+      if (Math.sign(dy + yoffset) !== 0 && Math.sign(dy + yoffset) !== yoffsetSign) {
+        // Gap is large enough that stopping the scan entirely and jumping
+        // straight to the next active row is worth it: flush, then emit a
+        // raw "N <Y move> SE" direct Y move — ported from the `dy+yoffset`
+        // rapid-move branch.
+        cutEnc.flush(false);
+        push(cutEnc.drain());
+        push(ascii('N'));
+        cutEnc.makeDirDist(0, dy + yoffset, false);
+        cutEnc.flush(false);
+        push(cutEnc.drain());
+        push(ascii('SE'));
+        rapidFlag = true;
+      } else {
+        // Gap is short enough that it's cheaper to walk it: each
+        // intervening row still forces the controller's automatic
+        // per-reversal Y step, so preload the stepper with a tiny
+        // non-cutting pad move and flip scan direction once per blank row,
+        // without touching the laser — ported from `adj_steps`.
+        const adjSteps = Math.trunc(dy / rowStepMils);
+        const adjDist = 5;
+        for (let stp = 1; stp < adjSteps; stp++) {
+          cutEnc.makeDirDist(sign * adjDist, 0, false);
+          lastX += sign * adjDist;
+          sign = -sign;
+          xr = sign === 1 ? rowPts[0].x : rowPts[rowPts.length - 1].x;
+          dxr = xr - lastX;
+        }
+      }
     }
 
+    // Backlash-compensation dance: overshoot opposite the new scan
+    // direction, travel the full distance, then re-overshoot forward —
+    // nets out to `dxr` but preloads the stepper before the reversal.
+    // Skipped (just a plain move) right after a jump-ahead or on the first
+    // row, since the head just came to a full stop there anyway — ported
+    // from the `Rapid_flag` row-end padding branch.
+    if (dxr * sign <= 0) {
+      if (!rapidFlag) {
+        cutEnc.makeDirDist(-sign * pad, 0, false);
+        cutEnc.makeDirDist(dxr, 0, false);
+        cutEnc.makeDirDist(sign * pad, 0, false);
+      } else {
+        cutEnc.makeDirDist(dxr, 0, false);
+      }
+      lastX += dxr;
+    }
+    rapidFlag = false;
+
+    const points = sign === 1 ? rowPts : rowPts.slice().reverse();
     let lastLoop = null;
     for (const pt of points) {
       const dx = pt.x - lastX;
@@ -569,6 +641,7 @@ export function buildRasterJob({ rows, rowStepMils, feedMmPerSec, board = 'M2' }
       lastX = pt.x;
       lastLoop = pt.loop;
     }
+    lastY = y;
   }
 
   // Final move to ensure the head ends up to the right, matching egv.py;
@@ -576,11 +649,6 @@ export function buildRasterJob({ rows, rowStepMils, feedMmPerSec, board = 'M2' }
   // stepped Y once more on this reversal.
   cutEnc.makeDirDist(pad, 0, false);
   lastX += pad;
-  // Y position after processing every row, tracked the same way egv.py's
-  // `lasty` is: each row steps the controller by `rowStepMils` from the
-  // last, and a final right-to-left row (sign < 0) steps it once more on
-  // its closing reversal.
-  let lastY = (rowPoints.length - 1) * rowStepMils;
   if (sign < 0) lastY += rowStepMils;
   cutEnc.flush(false);
   push(cutEnc.toBytes());
