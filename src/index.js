@@ -8,6 +8,9 @@ export {
   UNLOCK_PACKET,
   HOME_PACKET,
   ESTOP_PACKET,
+  buildSetPowerPacket,
+  buildPulsePacket,
+  DISABLE_TEST_FIRE_PACKET,
   K40Transport,
 } from './transport.js';
 export { LaserSpeed } from './laser-speed.js';

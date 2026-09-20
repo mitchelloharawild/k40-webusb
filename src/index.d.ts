@@ -14,12 +14,19 @@ export const Status: Readonly<{
 }>;
 
 /** Build a framed 34-byte packet from up to 30 payload bytes (or an ASCII string). */
-export function buildPacket(payload: string | Iterable<number>): Uint8Array;
+export function buildPacket(payload: string | Iterable<number>, options?: { padByte?: number }): Uint8Array;
 
 export const HELLO_PACKET: Uint8Array;
 export const UNLOCK_PACKET: Uint8Array;
 export const HOME_PACKET: Uint8Array;
 export const ESTOP_PACKET: Uint8Array;
+
+/** Build an "AT1" set-PWM-register packet (0-100% power). M3-Nano only. */
+export function buildSetPowerPacket(pctPower: number): Uint8Array;
+/** Build an "AT0" pulse packet for a single chunk of up to 254ms. M3-Nano only. */
+export function buildPulsePacket(pctPower: number, durationMs: number): Uint8Array;
+/** Fixed "AT00" packet that stops an in-progress test pulse. M3-Nano only. */
+export const DISABLE_TEST_FIRE_PACKET: Uint8Array;
 
 export interface SendJobOptions {
   signal?: AbortSignal;
@@ -56,6 +63,13 @@ export class K40Transport {
   unlock(): Promise<number | null>;
   home(): Promise<number | null>;
   estop(): Promise<number | null>;
+
+  /** Set the M3-Nano's PWM power register (0-100%). M3-Nano only — a no-op on the stock M2-Nano. */
+  setPower(pctPower: number): Promise<number | null>;
+  /** Fire the laser at `pctPower`% for `ms` milliseconds (test-fire calibration). M3-Nano only. */
+  pulse(pctPower: number, ms: number): Promise<void>;
+  /** Stop an in-progress `pulse()` early. M3-Nano only. */
+  stopTestFire(): Promise<number | null>;
 }
 
 export const LaserSpeed: {

@@ -26,14 +26,21 @@ function textBytes(str) {
 
 /**
  * Build a framed 34-byte packet from up to 30 payload bytes (or an ASCII
- * string). Unused payload bytes are padded with 'F' and the trailing CRC
- * byte is computed over bytes[1..31] inclusive, matching `send_data()` /
+ * string). Unused payload bytes are padded with `padByte` (default 'F',
+ * matching the job-stream framing in `send_data()`) and the trailing CRC
+ * byte is computed over bytes[1..31] inclusive, matching
  * `OneWireCRC(packet[1:len(packet)-2])` in nano_library.py.
  *
+ * The AT-prefixed power-control packets (see `buildSetPowerPacket()` et al.
+ * below) are the one exception in the upstream protocol: nano_library.py's
+ * literal arrays for those pad with 0x00, not 'F' — pass `padByte: 0x00` to
+ * match.
+ *
  * @param {string | Iterable<number>} payload
+ * @param {{ padByte?: number }} [options]
  * @returns {Uint8Array} 34-byte packet
  */
-export function buildPacket(payload) {
+export function buildPacket(payload, { padByte = PAD_BYTE } = {}) {
   const bytes = typeof payload === 'string' ? textBytes(payload) : Array.from(payload);
   if (bytes.length > PAYLOAD_LENGTH) {
     throw new RangeError(`payload too long for one packet (${bytes.length} > ${PAYLOAD_LENGTH})`);
@@ -42,7 +49,7 @@ export function buildPacket(payload) {
   packet[0] = FRAME_HEADER;
   packet[1] = 0x00;
   for (let i = 0; i < PAYLOAD_LENGTH; i++) {
-    packet[2 + i] = i < bytes.length ? bytes[i] : PAD_BYTE;
+    packet[2 + i] = i < bytes.length ? bytes[i] : padByte;
   }
   packet[32] = FRAME_HEADER;
   packet[33] = oneWireCrc(packet.subarray(1, 32));
@@ -55,6 +62,59 @@ export const HELLO_PACKET = new Uint8Array([0xa0]);
 export const UNLOCK_PACKET = buildPacket('IS2P');
 export const HOME_PACKET = buildPacket('IPP');
 export const ESTOP_PACKET = buildPacket('I');
+
+/**
+ * Encode a 0-100% power level as the M3-Nano's two-byte `m`/`n` PWM value,
+ * matching `set_PWM_register()`/`pulse_laser()` in nano_library.py.
+ * @param {number} pctPower 0-100
+ * @returns {[number, number]} [m, n]
+ */
+function encodePower(pctPower) {
+  if (!(pctPower >= 0 && pctPower <= 100)) {
+    throw new RangeError(`pctPower must be within 0-100 (got ${pctPower})`);
+  }
+  const power = Math.round(pctPower * 10);
+  return [Math.floor(power / 254), power % 254];
+}
+
+/**
+ * Build an "AT1" set-PWM-register packet: sets the laser's power level for
+ * whatever fires next (a job or a test pulse) without firing it itself.
+ * **M3-Nano only** — the stock M2-Nano has no PWM register; power there is
+ * set purely by the physical potentiometer. Ported from `set_PWM_register()`
+ * in nano_library.py:451-458. Zero-padded (see `buildPacket()`'s note),
+ * unlike ordinary job-stream packets.
+ * @param {number} pctPower 0-100
+ * @returns {Uint8Array} 34-byte packet
+ */
+export function buildSetPowerPacket(pctPower) {
+  const [m, n] = encodePower(pctPower);
+  return buildPacket([65, 84, 49, m, n], { padByte: 0x00 });
+}
+
+/**
+ * Build an "AT0" pulse (test-fire) packet for a single chunk of up to 254ms.
+ * **M3-Nano only.** Ported from `pulse_laser()` in nano_library.py:430-448 —
+ * that function itself chunks a longer duration into repeated ≤254ms
+ * packets; `K40Transport#pulse()` does that chunking and calls this once per
+ * chunk. Zero-padded, unlike ordinary job-stream packets.
+ * @param {number} pctPower 0-100
+ * @param {number} durationMs 0-254
+ * @returns {Uint8Array} 34-byte packet
+ */
+export function buildPulsePacket(pctPower, durationMs) {
+  if (!(durationMs >= 0 && durationMs <= 254)) {
+    throw new RangeError(`durationMs must be within 0-254 for a single pulse chunk (got ${durationMs})`);
+  }
+  const [m, n] = encodePower(pctPower);
+  return buildPacket([65, 84, 48, m, n, durationMs], { padByte: 0x00 });
+}
+
+/**
+ * "AT00" fixed packet that stops an in-progress test pulse. **M3-Nano
+ * only.** Ported from `disable_shot_laser()` in nano_library.py:460-463.
+ */
+export const DISABLE_TEST_FIRE_PACKET = buildPacket([65, 84, 48, 48], { padByte: 0x00 });
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -236,5 +296,40 @@ export class K40Transport {
 
   async estop() {
     return this.sendPacket(ESTOP_PACKET);
+  }
+
+  /**
+   * Set the M3-Nano's PWM power register (0-100%) for whatever fires next —
+   * a job or `pulse()`. **M3-Nano only**: the stock M2-Nano ignores this
+   * (no PWM register wired up); power there is set by the physical
+   * potentiometer.
+   * @param {number} pctPower 0-100
+   */
+  async setPower(pctPower) {
+    return this.sendPacket(buildSetPowerPacket(pctPower));
+  }
+
+  /**
+   * Fire the laser at `pctPower` for `ms` milliseconds — used for test-fire
+   * power calibration, not job cutting. **M3-Nano only.** Chunks `ms` into
+   * ≤254ms packets, matching `pulse_laser()` in nano_library.py:430-448:
+   * `Math.floor(ms / 254)` full 254ms chunks, then always one final chunk of
+   * `ms % 254` (even when that's 0).
+   * @param {number} pctPower 0-100
+   * @param {number} ms >= 0
+   */
+  async pulse(pctPower, ms) {
+    const wholeChunks = Math.floor(ms / 254);
+    for (let i = 0; i < wholeChunks; i++) {
+      await this.sendPacket(buildPulsePacket(pctPower, 254));
+    }
+    await this.sendPacket(buildPulsePacket(pctPower, ms % 254));
+  }
+
+  /**
+   * Stop an in-progress `pulse()` test-fire early. **M3-Nano only.**
+   */
+  async stopTestFire() {
+    return this.sendPacket(DISABLE_TEST_FIRE_PACKET);
   }
 }
