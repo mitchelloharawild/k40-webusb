@@ -54,6 +54,31 @@ await laser.sendJob(job);
 await laser.disconnect();
 ```
 
+`sendJob()` accepts an `AbortSignal` and a progress callback, for cancelling
+a long-running job or driving a progress bar. Aborting only stops feeding the
+controller more of the stream — whatever's already buffered on the board
+keeps running until it drains, so pair it with `estop()` if the motion itself
+needs to stop too:
+
+```js
+const controller = new AbortController();
+await laser.sendJob(job, {
+  signal: controller.signal,
+  onProgress: (sent, total) => console.log(`${sent}/${total} bytes`),
+});
+// elsewhere: controller.abort(); await laser.estop();
+```
+
+For jogging the head (or any other plain reposition with the laser off),
+`buildJogJob()` builds a move-only job — the same header/footer framing as
+`buildVectorJob()`, minus any cuts:
+
+```js
+import { buildJogJob } from 'k40-webusb';
+
+await laser.sendJob(buildJogJob({ dxMils: 500, dyMils: 0, feedMmPerSec: 100 }));
+```
+
 Raster (image engraving) jobs scan bidirectionally, row by row; each row is
 a list of `[xStart, xEnd]` laser-on intervals (mils) rather than a full
 bitmap, so you decide how to derive burn intervals from your image (e.g.

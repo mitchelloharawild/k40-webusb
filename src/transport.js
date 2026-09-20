@@ -200,14 +200,29 @@ export class K40Transport {
    * Send a full LHYMICRO-GL byte stream (from lhymicro.js), chunked into
    * 30-byte payloads and framed/verified packet-by-packet, then block until
    * the controller reports completion.
+   *
+   * `signal`, if given, is checked before each packet write; once aborted, no
+   * further packets are sent and the returned promise rejects with an
+   * `AbortError` `DOMException` instead of waiting for completion. The
+   * controller itself has no cancel command — this only stops feeding it more
+   * of the stream, so whatever's already buffered on the board keeps running
+   * until it drains. Follow an abort with `estop()` if the motion itself also
+   * needs to be stopped.
+   *
    * @param {Iterable<number>} bytes
+   * @param {object} [options]
+   * @param {AbortSignal} [options.signal]
+   * @param {(sentBytes: number, totalBytes: number) => void} [options.onProgress]
    */
-  async sendJob(bytes) {
+  async sendJob(bytes, { signal, onProgress } = {}) {
     const data = Array.from(bytes);
     for (let offset = 0; offset < data.length; offset += PAYLOAD_LENGTH) {
+      if (signal?.aborted) throw new DOMException('K40Transport: job aborted', 'AbortError');
       const chunk = data.slice(offset, offset + PAYLOAD_LENGTH);
       await this.sendPacket(buildPacket(chunk));
+      onProgress?.(Math.min(offset + PAYLOAD_LENGTH, data.length), data.length);
     }
+    if (signal?.aborted) throw new DOMException('K40Transport: job aborted', 'AbortError');
     await this.waitForFinish();
   }
 

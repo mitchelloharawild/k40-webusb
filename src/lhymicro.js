@@ -469,6 +469,43 @@ export function buildVectorJob({ paths, feedMmPerSec, board = 'M2' }) {
 }
 
 /**
+ * Build a laser-off rapid-move job: header travel move + footer, no cuts —
+ * for jogging the head (or any other plain reposition) rather than cutting.
+ * Structurally this is exactly `buildVectorJob()`'s header/footer with the
+ * cut section removed, since egv.py builds a "just move" job the same way a
+ * real cut job starts (speed code, travel to target, direction-priming
+ * `N<dir><dir>S1E`, footer) — there's no separate lighter-weight opcode for
+ * a standalone move.
+ *
+ * @param {object} opts
+ * @param {number} opts.dxMils relative move, mils
+ * @param {number} opts.dyMils relative move, mils
+ * @param {number} opts.feedMmPerSec
+ * @param {string} [opts.board='M2']
+ * @returns {Uint8Array} bytes ready for `K40Transport#sendJob()`
+ */
+export function buildJogJob({ dxMils, dyMils, feedMmPerSec, board = 'M2' }) {
+  const bytes = [];
+  const push = (arr) => bytes.push(...arr);
+
+  push(makeSpeed(feedMmPerSec, board, 0));
+
+  const headerEnc = new LhymicroEncoder();
+  headerEnc.makeDirDist(dxMils, dyMils, false);
+  headerEnc.flush(false);
+  push(headerEnc.toBytes());
+
+  push(ascii('N'));
+  push([dyMils <= 0 ? Opcode.DOWN : Opcode.UP]);
+  push([dxMils >= 0 ? Opcode.RIGHT : Opcode.LEFT]);
+  push(ascii('S1E'));
+
+  push(ascii('FNSE'));
+
+  return Uint8Array.from(bytes);
+}
+
+/**
  * Build a complete raster (image engraving) job: a speed code with an
  * embedded raster step, a "swing"-mode header, boustrophedon (alternating
  * left/right) scanning of each row with the small backlash-compensation

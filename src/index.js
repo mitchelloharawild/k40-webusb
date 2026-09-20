@@ -18,4 +18,5 @@ export {
   makeSpeed,
   buildVectorJob,
   buildRasterJob,
+  buildJogJob,
 } from './lhymicro.js';
