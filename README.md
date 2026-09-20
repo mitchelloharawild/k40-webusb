@@ -7,8 +7,9 @@ protocol reverse-engineered by [K40 Whisperer](https://www.scorchworks.com/K40wh
 (see `NOTICE.md` for provenance).
 
 This is an early scaffold: the low-level transport and the straight/diagonal
-vector-cutting path are implemented, including dogleg-optimized rapid travel
-between cut paths; raster jobs and mid-job speed changes are not yet ported.
+vector-cutting and raster (image engraving) paths are implemented,
+including dogleg-optimized rapid travel between vector cut paths; mid-job
+speed changes and the raster path's rapid-travel mode are not yet ported.
 
 ## Why WebUSB, not Web Serial
 
@@ -61,6 +62,32 @@ await laser.sendJob(job);
 await laser.disconnect();
 ```
 
+Raster (image engraving) jobs scan bidirectionally, row by row; each row is
+a list of `[xStart, xEnd]` laser-on intervals (mils) rather than a full
+bitmap, so you decide how to derive burn intervals from your image (e.g.
+thresholding pixels and run-length-encoding each row):
+
+```js
+import { K40Transport, buildRasterJob } from 'k40-webusb';
+
+const laser = new K40Transport();
+await laser.connect();
+await laser.unlock();
+
+const job = buildRasterJob({
+  rows: [
+    [[0, 1000]], // row 0: burn from 0 to 1000 mils
+    [[200, 800]], // row 1
+    [[0, 1000]], // row 2
+  ],
+  rowStepMils: 10, // 10 mils between rows
+  feedMmPerSec: 100,
+});
+await laser.sendJob(job);
+
+await laser.disconnect();
+```
+
 ## Module layout
 
 - `src/crc.js` — 1-Wire/Dallas CRC-8 used to checksum every packet.
@@ -68,16 +95,16 @@ await laser.disconnect();
   the status-poll handshake, `K40Transport`.
 - `src/laser-speed.js` — feed-rate ↔ speed-code conversion (`LaserSpeed`).
 - `src/lhymicro.js` — the LHYMICRO-GL opcode language: modal move tracking,
-  distance encoding, diagonal cut-line decomposition, `buildVectorJob()`.
+  distance encoding, diagonal cut-line decomposition, `buildVectorJob()`,
+  `buildRasterJob()`.
 - `src/index.js` — public API barrel.
 
 ## Known gaps
 
-- Only PID `0x5512` (genuine M2-Nano boards) is targeted; other
-  Lihuiyu/Moshiboard variants use different PIDs and aren't covered.
-- No raster (image engraving) job support yet.
-- No mid-job speed changes — every path in a job is cut at a single feed
-  rate.
-- Timing constants (200ms status-poll timeout, 10 retries) are carried over
-  from K40 Whisperer's empirically-tuned values; expect to re-tune against
-  real hardware.
+- Raster jobs require every row to have at least one burn interval — the
+  original's blank-row jump-ahead optimization (collapsing several blank
+  rows into one larger Y move) isn't ported.
+- No mid-job speed changes — every path in a vector job, and the whole
+  raster job, is cut at a single feed rate.
+- Raster jobs don't yet get the dogleg/rapid-feed travel optimizations that
+  vector jobs' between-path travel has.

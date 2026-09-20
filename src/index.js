@@ -11,4 +11,11 @@ export {
   K40Transport,
 } from './transport.js';
 export { LaserSpeed } from './laser-speed.js';
-export { Opcode, encodeDistance, LhymicroEncoder, makeSpeed, buildVectorJob } from './lhymicro.js';
+export {
+  Opcode,
+  encodeDistance,
+  LhymicroEncoder,
+  makeSpeed,
+  buildVectorJob,
+  buildRasterJob,
+} from './lhymicro.js';

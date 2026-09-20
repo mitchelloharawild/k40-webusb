@@ -3,10 +3,13 @@
  *
  * Ported from egv.py's `egv` class (move/flush/make_distance/make_dir_dist/
  * make_cut_line/make_egv_data/rapid_move_fast). This covers straight-line
- * vector cutting, including multi-path jobs with dogleg-optimized travel
- * between paths; it does NOT yet port raster jobs, mid-job speed changes
- * (change_speed), or the temporary-rapid-feed travel mode (rapid_move_slow)
- * — see _dev/webapp.md §6 in k40-control for what those do in the original.
+ * vector cutting (including multi-path jobs with dogleg-optimized travel
+ * between paths) and raster (image engraving) jobs; it does NOT yet port
+ * mid-job speed changes (change_speed), the temporary-rapid-feed travel
+ * mode (rapid_move_slow/raster_rapid_move_slow — both depend on
+ * change_speed), or the raster path's blank-row jump-ahead optimization
+ * (multiple blank rows collapsed into one Y move) — see _dev/webapp.md §6
+ * in k40-control for what those do in the original.
  */
 import { LaserSpeed } from './laser-speed.js';
 
@@ -389,6 +392,134 @@ export function buildVectorJob({ paths, feedMmPerSec, board = 'M2' }) {
 
   enc.flush(false);
   push(enc.toBytes());
+
+  push(ascii('FNSE'));
+
+  return Uint8Array.from(bytes);
+}
+
+/**
+ * Build a complete raster (image engraving) job: a speed code with an
+ * embedded raster step, a "swing"-mode header, boustrophedon (alternating
+ * left/right) scanning of each row with the small backlash-compensation
+ * "pad" move at each direction reversal, and a return move + footer — the
+ * `Raster_step != 0` branch of `make_egv_data()` in egv.py, minus its
+ * blank-row jump optimization (`adj_steps`), `Rapid_Feed_Rate` travel mode,
+ * and `FlipXoffset` mirroring.
+ *
+ * The controller itself steps the Y axis by exactly `rowStepMils` (per the
+ * `G<step>` suffix in the raster speed code) each time the horizontal scan
+ * direction reverses, so this function never emits an explicit Y move
+ * within a row — only once, in the final return-to-start move.
+ *
+ * @param {object} opts
+ * @param {[number, number][][]} opts.rows one entry per scan line, top to
+ *   bottom; each entry is an ascending, non-overlapping array of
+ *   `[xStartMils, xEndMils]` laser-on intervals for that row, relative to a
+ *   shared X origin. Every row must have at least one interval — this does
+ *   not port egv.py's handling of blank rows.
+ * @param {number} opts.rowStepMils distance between rows, mils; sign
+ *   selects the controller's raster scan orientation ("L" if >= 0, "R" if
+ *   < 0), matching `Raster_step`'s sign in egv.py.
+ * @param {number} opts.feedMmPerSec
+ * @param {string} [opts.board='M2']
+ * @returns {Uint8Array} bytes ready for `K40Transport#sendJob()`
+ */
+export function buildRasterJob({ rows, rowStepMils, feedMmPerSec, board = 'M2' }) {
+  if (rows.length === 0) {
+    throw new Error('buildRasterJob: need at least one row');
+  }
+  if (rowStepMils === 0) {
+    throw new Error('buildRasterJob: rowStepMils must be non-zero');
+  }
+
+  // Flatten each row's [start, end] intervals into an ascending list of
+  // (x, loop) points, where two consecutive points sharing a loop id are a
+  // laser-on cut (the interval itself) and points from different loop ids
+  // are a laser-off positioning move — ported from the `scanline`/`loop`
+  // bookkeeping in make_egv_data()'s raster branch.
+  const rowPoints = rows.map((intervals, row) => {
+    const points = intervals.flatMap((iv, idx) => [
+      { x: iv[0], loop: idx },
+      { x: iv[1], loop: idx },
+    ]);
+    if (points.length === 0) {
+      throw new Error(`buildRasterJob: row ${row} has no burn intervals`);
+    }
+    return points;
+  });
+
+  const bytes = [];
+  const push = (arr) => bytes.push(...arr);
+
+  push(makeSpeed(feedMmPerSec, board, rowStepMils));
+
+  // Initial travel move (laser off) to the first row's entry point (its
+  // leftmost point, since the first row always scans left-to-right).
+  let lastX = rowPoints[0][0].x;
+  const headerEnc = new LhymicroEncoder();
+  headerEnc.makeDirDist(lastX, 0, false);
+  headerEnc.flush(false);
+  push(headerEnc.toBytes());
+
+  push(ascii('N'));
+  push(ascii(rowStepMils < 0 ? 'R' : 'L'));
+  push(ascii('B'));
+  push(ascii('S1E'));
+
+  const cutEnc = new LhymicroEncoder();
+  const pad = 2;
+  let sign = -1;
+  let trackedY = 0;
+
+  for (let i = 0; i < rowPoints.length; i++) {
+    sign = -sign;
+    const points = sign === 1 ? rowPoints[i] : rowPoints[i].slice().reverse();
+
+    const xr = points[0].x;
+    const dxr = xr - lastX;
+    if (i > 0 && dxr * sign <= 0) {
+      // Backlash-compensation dance: overshoot opposite the new scan
+      // direction, travel the full distance, then re-overshoot forward —
+      // nets out to `dxr` but preloads the stepper before the reversal.
+      // Ported from the `Rapid_flag == False` row-end padding branch.
+      cutEnc.makeDirDist(-sign * pad, 0, false);
+      cutEnc.makeDirDist(dxr, 0, false);
+      cutEnc.makeDirDist(sign * pad, 0, false);
+      lastX += dxr;
+    }
+
+    let lastLoop = null;
+    for (const pt of points) {
+      const dx = pt.x - lastX;
+      if (pt.loop === lastLoop) {
+        cutEnc.makeCutLine(dx, 0, true);
+      } else if (dx * sign > 0) {
+        cutEnc.makeDirDist(dx, 0, false);
+      }
+      lastX = pt.x;
+      lastLoop = pt.loop;
+    }
+  }
+
+  // Final move to ensure the head ends up to the right, matching egv.py;
+  // if the last row scanned right-to-left, the controller will have
+  // stepped Y once more on this reversal.
+  cutEnc.makeDirDist(pad, 0, false);
+  lastX += pad;
+  if (sign < 0) trackedY += rowStepMils;
+  cutEnc.flush(false);
+  push(cutEnc.toBytes());
+
+  // Plain (non-optimized) travel move back to the job's starting position.
+  const dxFinal = -lastX;
+  const dyFinal = rowStepMils < 0 ? -trackedY + rowStepMils : -trackedY - rowStepMils;
+  const returnEnc = new LhymicroEncoder();
+  returnEnc.makeDirDist(dxFinal, dyFinal, false);
+  returnEnc.flush(false);
+  push(ascii('N'));
+  push(returnEnc.toBytes());
+  push(ascii('SE'));
 
   push(ascii('FNSE'));
 
