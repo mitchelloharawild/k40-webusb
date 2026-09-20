@@ -2,10 +2,11 @@
  * LHYMICRO-GL: the byte-opcode job language the M2-Nano executes.
  *
  * Ported from egv.py's `egv` class (move/flush/make_distance/make_dir_dist/
- * make_cut_line/make_egv_data). This covers straight-line vector cutting;
- * it does NOT yet port raster jobs, mid-job speed changes (change_speed),
- * or the "rapid_move_fast" dogleg optimization for non-cutting travel —
- * see _dev/webapp.md §6 in k40-control for what those do in the original.
+ * make_cut_line/make_egv_data/rapid_move_fast). This covers straight-line
+ * vector cutting, including multi-path jobs with dogleg-optimized travel
+ * between paths; it does NOT yet port raster jobs, mid-job speed changes
+ * (change_speed), or the temporary-rapid-feed travel mode (rapid_move_slow)
+ * — see _dev/webapp.md §6 in k40-control for what those do in the original.
  */
 import { LaserSpeed } from './laser-speed.js';
 
@@ -220,6 +221,19 @@ export class LhymicroEncoder {
   toBytes() {
     return Uint8Array.from(this.#codes);
   }
+
+  /**
+   * Return and clear the buffered bytes so far, leaving modal state (the
+   * current direction/laser/axis tracking) untouched. Used to splice raw,
+   * non-modal framing bytes (e.g. a dogleg travel move) into the middle of
+   * an otherwise-continuous modal byte stream, matching how egv.py's `self`
+   * keeps a single running encoder across arbitrary `self.write()` calls.
+   */
+  drain() {
+    const codes = this.#codes;
+    this.#codes = [];
+    return codes;
+  }
 }
 
 /**
@@ -239,24 +253,79 @@ function ascii(str) {
   return Array.from(str, (c) => c.charCodeAt(0));
 }
 
+// Below this threshold (in either axis) a non-cutting move is short enough
+// that the dogleg detour would cost more than it saves, so it's just sent
+// as a plain move instead — the `min_rapid` check in make_egv_data().
+const MIN_RAPID_MILS = 5;
+
 /**
- * Build a complete vector-cut job: speed code, header, a straight/diagonal
- * cut through each point in order, and a return move + footer — the
- * `Raster_step == 0` branch of `make_egv_data()` in egv.py, minus rapid-move
- * dogleg optimization and mid-job speed changes.
+ * Dogleg-shaped rapid travel move: briefly overshoot away from the cut —
+ * backward on X, then away on Y — before covering the remaining distance,
+ * so a long non-cutting move doesn't drag the head back across material
+ * that's still in its path. Emits its own self-contained raw framing
+ * (`<dir> N <move> S E`), independent of any surrounding modal encoder
+ * state — ported from `rapid_move_fast()` in egv.py.
+ *
+ * @param {number} dxMils
+ * @param {number} dyMils
+ * @returns {number[]} char codes
+ */
+function rapidMoveFast(dxMils, dyMils) {
+  let pad = 3;
+  if (pad === -dxMils) pad += 3;
+
+  const bytes = [];
+
+  const padEnc = new LhymicroEncoder();
+  padEnc.makeDirDist(-pad, 0, false);
+  padEnc.makeDirDist(0, pad, false);
+  padEnc.flush(false);
+  bytes.push(...padEnc.toBytes());
+
+  // Re-prime the direction state (no distance follows) before the raw "N"
+  // move section, matching the header's own direction-priming dance.
+  bytes.push(dxMils + pad < 0 ? Opcode.RIGHT : Opcode.LEFT);
+  bytes.push(...ascii('N'));
+
+  const moveEnc = new LhymicroEncoder();
+  moveEnc.makeDirDist(dxMils + pad, dyMils - pad, false);
+  moveEnc.flush(false);
+  bytes.push(...moveEnc.toBytes());
+
+  bytes.push(...ascii('SE'));
+  return bytes;
+}
+
+/**
+ * Build a complete vector-cut job: speed code, header, one or more cut
+ * paths (straight/diagonal segments through each path's points in order),
+ * and a return move + footer — the `Raster_step == 0` branch of
+ * `make_egv_data()` in egv.py, minus mid-job speed changes.
+ *
+ * Laser-off travel — between paths, and the final move back to the job's
+ * starting position — uses a plain move when short, or a dogleg-optimized
+ * rapid move (`rapid_move_fast`) when long enough that dragging the head
+ * straight through material in its path would matter.
  *
  * @param {object} opts
- * @param {[number, number][]} opts.points path vertices in mils, relative
- *   to the machine's current position; points[0] is a laser-off travel move,
- *   subsequent points are cut with the laser on.
+ * @param {[number, number][][]} opts.paths one array per cut path, each an
+ *   array of vertices in mils, relative to the machine's current position
+ *   (paths[0][0]) or the previous path's last point (paths[n>0][0]); each
+ *   path's first point is a laser-off travel move, the rest are cut with
+ *   the laser on. Every path needs at least 2 points.
  * @param {number} opts.feedMmPerSec
  * @param {string} [opts.board='M2']
  * @returns {Uint8Array} bytes ready for `K40Transport#sendJob()`
  */
-export function buildVectorJob({ points, feedMmPerSec, board = 'M2' }) {
-  if (points.length < 2) {
-    throw new Error('buildVectorJob: need at least a start point and one cut point');
+export function buildVectorJob({ paths, feedMmPerSec, board = 'M2' }) {
+  if (!paths || paths.length === 0) {
+    throw new Error('buildVectorJob: need at least one path');
   }
+  paths.forEach((path, i) => {
+    if (path.length < 2) {
+      throw new Error(`buildVectorJob: path ${i} needs a start point and at least one cut point`);
+    }
+  });
 
   const bytes = [];
   const push = (arr) => bytes.push(...arr);
@@ -264,8 +333,10 @@ export function buildVectorJob({ points, feedMmPerSec, board = 'M2' }) {
   push(makeSpeed(feedMmPerSec, board, 0));
 
   // Initial travel move (laser off) from the current head position to the
-  // first path vertex. `points` are mils, relative to that starting position.
-  const [startX, startY] = points[0];
+  // first path's first vertex. Points are mils, relative to that starting
+  // position. This header move is always plain, even for a long distance —
+  // egv.py only dogleg-optimizes travel that happens mid-job.
+  const [startX, startY] = paths[0][0];
   const headerEnc = new LhymicroEncoder();
   headerEnc.makeDirDist(startX, startY, false);
   headerEnc.flush(false);
@@ -276,28 +347,48 @@ export function buildVectorJob({ points, feedMmPerSec, board = 'M2' }) {
   push([startX >= 0 ? Opcode.RIGHT : Opcode.LEFT]);
   push(ascii('S1E'));
 
-  // Cut through the remaining vertices in order, laser on throughout.
-  const cutEnc = new LhymicroEncoder();
+  // A single continuous modal encoder for everything from here to the
+  // footer — cuts, plain in-between travel, and the pad moves inside a
+  // dogleg — matching egv.py's single `self` instance across the whole job.
+  const enc = new LhymicroEncoder();
   let lastX = startX;
   let lastY = startY;
-  for (let i = 1; i < points.length; i++) {
-    const [x, y] = points[i];
-    cutEnc.makeCutLine(x - lastX, y - lastY, true);
+
+  const travelTo = (x, y) => {
+    const dx = x - lastX;
+    const dy = y - lastY;
     lastX = x;
     lastY = y;
-  }
-  cutEnc.flush(false);
-  push(cutEnc.toBytes());
+    if (dx === 0 && dy === 0) return;
+    if (Math.abs(dx) < MIN_RAPID_MILS && Math.abs(dy) < MIN_RAPID_MILS) {
+      enc.makeDirDist(dx, dy, false);
+    } else {
+      enc.flush(false);
+      push(enc.drain());
+      push(rapidMoveFast(dx, dy));
+    }
+  };
 
-  // Plain (non-optimized) travel move back to the job's starting position.
-  // egv.py instead picks between a "dogleg" rapid move and a temporary
-  // rapid feed rate here (rapid_move_fast/rapid_move_slow) — not ported.
-  const returnEnc = new LhymicroEncoder();
-  returnEnc.makeDirDist(-lastX, -lastY, false);
-  returnEnc.flush(false);
-  push(ascii('N'));
-  push(returnEnc.toBytes());
-  push(ascii('SE'));
+  for (let p = 0; p < paths.length; p++) {
+    const path = paths[p];
+    if (p > 0) {
+      const [x, y] = path[0];
+      travelTo(x, y);
+    }
+    for (let i = 1; i < path.length; i++) {
+      const [x, y] = path[i];
+      enc.makeCutLine(x - lastX, y - lastY, true);
+      lastX = x;
+      lastY = y;
+    }
+  }
+
+  // Travel move back to the job's starting position (mils 0,0), optimized
+  // the same way as travel between paths.
+  travelTo(0, 0);
+
+  enc.flush(false);
+  push(enc.toBytes());
 
   push(ascii('FNSE'));
 

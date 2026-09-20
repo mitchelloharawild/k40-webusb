@@ -7,8 +7,8 @@ protocol reverse-engineered by [K40 Whisperer](https://www.scorchworks.com/K40wh
 (see `NOTICE.md` for provenance).
 
 This is an early scaffold: the low-level transport and the straight/diagonal
-vector-cutting path are implemented; raster jobs, mid-job speed changes, and
-the rapid-move travel optimizations from the original are not yet ported.
+vector-cutting path are implemented, including dogleg-optimized rapid travel
+between cut paths; raster jobs and mid-job speed changes are not yet ported.
 
 ## Why WebUSB, not Web Serial
 
@@ -41,13 +41,18 @@ await laser.connect();
 await laser.unlock();
 
 // Cut a 1" square, 1000 mils per side, at 10mm/s. Points are mils, relative
-// to the current head position; the first point is a laser-off travel move.
+// to the current head position; each path's first point is a laser-off
+// travel move. Travel between paths (and back to the start at the end) is
+// a plain move when short, or a dogleg-shaped "rapid" move when long enough
+// that dragging the head straight through material would matter.
 const job = buildVectorJob({
-  points: [
-    [0, 1000],
-    [1000, 1000],
-    [1000, 0],
-    [0, 0],
+  paths: [
+    [
+      [0, 1000],
+      [1000, 1000],
+      [1000, 0],
+      [0, 0],
+    ],
   ],
   feedMmPerSec: 10,
 });
@@ -71,8 +76,8 @@ await laser.disconnect();
 - Only PID `0x5512` (genuine M2-Nano boards) is targeted; other
   Lihuiyu/Moshiboard variants use different PIDs and aren't covered.
 - No raster (image engraving) job support yet.
-- No mid-job speed changes or rapid-move travel optimization — every
-  non-cutting move is a plain, unoptimized move.
+- No mid-job speed changes — every path in a job is cut at a single feed
+  rate.
 - Timing constants (200ms status-poll timeout, 10 retries) are carried over
   from K40 Whisperer's empirically-tuned values; expect to re-tune against
   real hardware.
