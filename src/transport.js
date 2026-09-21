@@ -245,9 +245,15 @@ export class K40Transport {
     throw new Error('K40Transport: CRC error persisted after max retries');
   }
 
-  /** Poll until the controller reports the running job is finished. */
-  async waitForFinish() {
+  /**
+   * Poll until the controller reports the running job is finished.
+   * @param {AbortSignal} [signal] checked before each poll; an already-aborted
+   *   or newly-aborted signal rejects with an `AbortError` `DOMException`
+   *   instead of continuing to wait.
+   */
+  async waitForFinish(signal) {
     for (;;) {
+      if (signal?.aborted) throw new DOMException('K40Transport: aborted while waiting for finish', 'AbortError');
       const status = await this.hello();
       if (status === Status.TASK_COMPLETE || status === Status.TASK_COMPLETE_M3) {
         return status;
@@ -273,6 +279,8 @@ export class K40Transport {
    * @param {object} [options]
    * @param {AbortSignal} [options.signal]
    * @param {(sentBytes: number, totalBytes: number) => void} [options.onProgress]
+   * @returns {Promise<number>} the completion Status (`TASK_COMPLETE` or
+   *   `TASK_COMPLETE_M3`) `waitForFinish()` saw
    */
   async sendJob(bytes, { signal, onProgress } = {}) {
     const data = Array.from(bytes);
@@ -283,7 +291,7 @@ export class K40Transport {
       onProgress?.(Math.min(offset + PAYLOAD_LENGTH, data.length), data.length);
     }
     if (signal?.aborted) throw new DOMException('K40Transport: job aborted', 'AbortError');
-    await this.waitForFinish();
+    return this.waitForFinish(signal);
   }
 
   async unlock() {

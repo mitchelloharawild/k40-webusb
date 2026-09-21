@@ -1,6 +1,6 @@
 {
   "name": "k40-webusb",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "WebUSB library for controlling a K40 laser cutter's M2-Nano/M3-Nano controller directly from the browser",
   "type": "module",
   "main": "src/index.js",

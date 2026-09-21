@@ -51,14 +51,18 @@ export class K40Transport {
 
   hello(): Promise<number | null>;
   sendPacket(packet: Uint8Array): Promise<number | null>;
-  waitForFinish(): Promise<number>;
+  /** @param signal checked before each poll; aborts reject with an `AbortError` `DOMException`. */
+  waitForFinish(signal?: AbortSignal): Promise<number>;
 
   /**
    * Send a full LHYMICRO-GL byte stream, chunked/framed/verified
    * packet-by-packet, then block until the controller reports completion.
-   * See `SendJobOptions` for cancellation/progress.
+   * See `SendJobOptions` for cancellation/progress. Resolves with the
+   * completion Status (`TASK_COMPLETE` or `TASK_COMPLETE_M3`) — a cheap way
+   * to tell an M2-Nano and M3-Nano apart, since that's the only place the
+   * board says so.
    */
-  sendJob(bytes: Iterable<number>, options?: SendJobOptions): Promise<void>;
+  sendJob(bytes: Iterable<number>, options?: SendJobOptions): Promise<number>;
 
   unlock(): Promise<number | null>;
   home(): Promise<number | null>;
