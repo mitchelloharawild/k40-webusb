@@ -8,6 +8,7 @@ export {
   UNLOCK_PACKET,
   HOME_PACKET,
   ESTOP_PACKET,
+  PAUSE_TOGGLE_PACKET,
   buildSetPowerPacket,
   buildPulsePacket,
   DISABLE_TEST_FIRE_PACKET,

@@ -20,6 +20,8 @@ export const HELLO_PACKET: Uint8Array;
 export const UNLOCK_PACKET: Uint8Array;
 export const HOME_PACKET: Uint8Array;
 export const ESTOP_PACKET: Uint8Array;
+/** "PN" toggles the controller's own pause state — see `K40Transport#pause()`/`#resume()`. */
+export const PAUSE_TOGGLE_PACKET: Uint8Array;
 
 /** Build an "AT1" set-PWM-register packet (0-100% power). M3-Nano only. */
 export function buildSetPowerPacket(pctPower: number): Uint8Array;
@@ -50,7 +52,8 @@ export class K40Transport {
   disconnect(): Promise<void>;
 
   hello(): Promise<number | null>;
-  sendPacket(packet: Uint8Array): Promise<number | null>;
+  /** @param options.signal checked before each buffer-full poll; aborts reject with an `AbortError` `DOMException`. */
+  sendPacket(packet: Uint8Array, options?: { signal?: AbortSignal }): Promise<number | null>;
   /** @param signal checked before each poll; aborts reject with an `AbortError` `DOMException`. */
   waitForFinish(signal?: AbortSignal): Promise<number>;
 
@@ -67,6 +70,17 @@ export class K40Transport {
   unlock(): Promise<number | null>;
   home(): Promise<number | null>;
   estop(): Promise<number | null>;
+
+  /**
+   * Pause the controller's own execution of a running job (real firmware
+   * motion pause, not just "stop feeding bytes"). Safe to call while a
+   * `sendJob()` call is in flight on this same transport. `pause()`/
+   * `resume()` send the identical toggle packet — see `PAUSE_TOGGLE_PACKET`.
+   * **Unverified against real hardware** — see `_dev/todo.md` §1 in k40-control.
+   */
+  pause(): Promise<number | null>;
+  /** Resume a job paused with `pause()`. */
+  resume(): Promise<number | null>;
 
   /** Set the M3-Nano's PWM power register (0-100%). M3-Nano only — a no-op on the stock M2-Nano. */
   setPower(pctPower: number): Promise<number | null>;

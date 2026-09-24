@@ -64,6 +64,18 @@ export const HOME_PACKET = buildPacket('IPP');
 export const ESTOP_PACKET = buildPacket('I');
 
 /**
+ * "PN" toggles the controller's own pause state — the same packet both
+ * pauses and resumes a running job. Confirmed against K40 Whisperer's
+ * `pause_un_pause()` (nano_library.py), which sends this exact command for
+ * both halves of its Pause/Stop button; there is no separate "resume"
+ * command on this protocol like meerk40t's serial-realtime `~PN!~`/`~PN&~`
+ * pair. `K40Transport#pause()`/`#resume()` both send this packet — which one
+ * it actually does on the board depends on whether it's currently paused,
+ * not on which method you called.
+ */
+export const PAUSE_TOGGLE_PACKET = buildPacket('PN');
+
+/**
  * Encode a 0-100% power level as the M3-Nano's two-byte `m`/`n` PWM value,
  * matching `set_PWM_register()`/`pulse_laser()` in nano_library.py.
  * @param {number} pctPower 0-100
@@ -130,6 +142,7 @@ export class K40Transport {
   #device = null;
   #outEndpoint = null;
   #inEndpoint = null;
+  #lock = Promise.resolve();
 
   constructor({ timeoutMs = 200, maxRetries = 10 } = {}) {
     this.timeoutMs = timeoutMs;
@@ -209,11 +222,30 @@ export class K40Transport {
   }
 
   /**
-   * Poll the controller's status. Retries silently on a missing/short
-   * response (a genuinely unresponsive device) up to maxRetries times.
-   * @returns {Promise<number|null>} a Status value, or null if unresponsive
+   * Run `fn` once every earlier call queued through this method has
+   * settled, so at most one write-then-read sequence is ever in flight on
+   * the wire. Needed because `pause()`/`resume()` can now be called from
+   * outside a job while `sendJob()` is mid-stream on the same transport —
+   * without this, the two calls' packet writes and status reads could
+   * interleave and corrupt the hello handshake (a write not immediately
+   * followed by its own matching read).
    */
-  async hello() {
+  async #serialized(fn) {
+    const previous = this.#lock;
+    let release;
+    this.#lock = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /** Unlocked hello poll — only for use from within a `#serialized()` critical section that already holds the lock. */
+  async #helloUnlocked() {
     for (let attempt = 0; attempt < this.maxRetries; attempt++) {
       await this.#writeRaw(HELLO_PACKET);
       const status = await this.#readStatus();
@@ -224,25 +256,43 @@ export class K40Transport {
   }
 
   /**
+   * Poll the controller's status. Retries silently on a missing/short
+   * response (a genuinely unresponsive device) up to maxRetries times.
+   * @returns {Promise<number|null>} a Status value, or null if unresponsive
+   */
+  async hello() {
+    return this.#serialized(() => this.#helloUnlocked());
+  }
+
+  /**
    * Send one already-framed 34-byte packet, honoring the buffer-full /
    * CRC-error handshake (send_packet_w_error_checking in nano_library.py).
    * There is no other flow-control signal from the controller — buffer-full
    * must be polled until it clears.
+   *
+   * @param {Uint8Array} packet
+   * @param {{ signal?: AbortSignal }} [options] `signal`, if given, is checked
+   *   before each buffer-full poll — needed because a paused controller (see
+   *   `pause()`) holds BUFFER_FULL indefinitely until resumed, which would
+   *   otherwise wedge a caller (e.g. `cancelJob()`) trying to abort out of it.
    */
-  async sendPacket(packet) {
+  async sendPacket(packet, { signal } = {}) {
     let status = await this.hello();
     while (status === Status.BUFFER_FULL) {
+      if (signal?.aborted) throw new DOMException('K40Transport: aborted while buffer full', 'AbortError');
       await sleep(this.timeoutMs);
       status = await this.hello();
     }
 
-    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
-      await this.#writeRaw(packet);
-      status = await this.hello();
-      if (status !== Status.CRC_ERROR) return status;
-      // CRC error: resend the identical packet.
-    }
-    throw new Error('K40Transport: CRC error persisted after max retries');
+    return this.#serialized(async () => {
+      for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+        await this.#writeRaw(packet);
+        const s = await this.#helloUnlocked();
+        if (s !== Status.CRC_ERROR) return s;
+        // CRC error: resend the identical packet.
+      }
+      throw new Error('K40Transport: CRC error persisted after max retries');
+    });
   }
 
   /**
@@ -287,7 +337,7 @@ export class K40Transport {
     for (let offset = 0; offset < data.length; offset += PAYLOAD_LENGTH) {
       if (signal?.aborted) throw new DOMException('K40Transport: job aborted', 'AbortError');
       const chunk = data.slice(offset, offset + PAYLOAD_LENGTH);
-      await this.sendPacket(buildPacket(chunk));
+      await this.sendPacket(buildPacket(chunk), { signal });
       onProgress?.(Math.min(offset + PAYLOAD_LENGTH, data.length), data.length);
     }
     if (signal?.aborted) throw new DOMException('K40Transport: job aborted', 'AbortError');
@@ -304,6 +354,29 @@ export class K40Transport {
 
   async estop() {
     return this.sendPacket(ESTOP_PACKET);
+  }
+
+  /**
+   * Pause the controller's own execution of a running job — real firmware
+   * motion pause, not just "stop feeding bytes" (contrast `sendJob()`'s
+   * `signal`, which only does the latter). Safe to call while a `sendJob()`
+   * call is in flight on this same transport (see `#serialized()`): once
+   * paused, the board stops draining its onboard buffer, so `sendJob()`'s
+   * own chunk loop will simply stall on the existing BUFFER_FULL handshake
+   * until `resume()` is called — no extra host-side gating needed.
+   *
+   * `pause()`/`resume()` send the identical packet (see `PAUSE_TOGGLE_PACKET`)
+   * — the board itself decides which effect it has based on its current
+   * state, not which of these two methods you call. **Unverified against
+   * real hardware** — see `_dev/todo.md` §1.
+   */
+  async pause() {
+    return this.sendPacket(PAUSE_TOGGLE_PACKET);
+  }
+
+  /** See `pause()` — sends the same toggle packet to resume a paused job. */
+  async resume() {
+    return this.sendPacket(PAUSE_TOGGLE_PACKET);
   }
 
   /**
